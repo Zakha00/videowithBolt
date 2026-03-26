@@ -37,6 +37,15 @@ _last_request: dict[int, float] = defaultdict(float)
 RATE_LIMIT_SECONDS = 10
 
 
+def safe_db_call(fn, *args, **kwargs):
+    """Не даёт ошибкам БД ломать обработку апдейта."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        logger.exception(f"Ошибка БД в {fn.__name__}: {e}")
+        return None
+
+
 def is_rate_limited(user_id: int) -> bool:
     now = time.time()
     if now - _last_request[user_id] < RATE_LIMIT_SECONDS:
@@ -82,12 +91,13 @@ async def check_subscription(user_id: int) -> bool:
 # ─── /start ──────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    db.upsert_user(
+    safe_db_call(
+        db.upsert_user,
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.first_name or "",
     )
-    count = db.get_download_count(message.from_user.id)
+    count = safe_db_call(db.get_download_count, message.from_user.id) or 0
     remaining = max(0, FREE_LIMIT - count)
 
     text = (
@@ -104,7 +114,7 @@ async def cmd_start(message: Message):
 # ─── /stats ───────────────────────────────────────────────────────────────────
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    count = db.get_download_count(message.from_user.id)
+    count = safe_db_call(db.get_download_count, message.from_user.id) or 0
     remaining = max(0, FREE_LIMIT - count)
     is_sub = await check_subscription(message.from_user.id)
     sub_status = "✅ Подписан" if is_sub else "❌ Не подписан"
@@ -124,8 +134,8 @@ async def cmd_admin(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    total_users = db.get_total_users()
-    today = db.get_today_stats()
+    total_users = safe_db_call(db.get_total_users) or 0
+    today = safe_db_call(db.get_today_stats)
     today_dl = today[1] if today else 0
 
     text = (
@@ -147,7 +157,7 @@ async def cmd_broadcast(message: Message):
         await message.answer("Использование: /broadcast Текст")
         return
 
-    user_ids = db.get_all_user_ids()
+    user_ids = safe_db_call(db.get_all_user_ids) or []
     sent, failed = 0, 0
     status_msg = await message.answer(f"⏳ Рассылаю {len(user_ids)} пользователям...")
 
@@ -173,7 +183,7 @@ async def cmd_broadcast(message: Message):
 async def callback_check_sub(call: CallbackQuery):
     is_sub = await check_subscription(call.from_user.id)
     if is_sub:
-        db.set_subscribed(call.from_user.id, True)
+        safe_db_call(db.set_subscribed, call.from_user.id, True)
         await call.message.edit_text(
             "✅ <b>Подписка подтверждена!</b>\n\n"
             "Теперь можешь скачивать без ограничений.\n"
@@ -195,17 +205,17 @@ async def handle_url(message: Message):
         return
 
     user_id = message.from_user.id
-    db.upsert_user(user_id, message.from_user.username or "", message.from_user.first_name or "")
+    safe_db_call(db.upsert_user, user_id, message.from_user.username or "", message.from_user.first_name or "")
 
     if is_rate_limited(user_id):
         await message.answer(f"⏱ Подожди {RATE_LIMIT_SECONDS} сек между запросами")
         return
 
-    count = db.get_download_count(user_id)
+    count = safe_db_call(db.get_download_count, user_id) or 0
     if count >= FREE_LIMIT:
         is_sub = await check_subscription(user_id)
         if not is_sub:
-            db.set_subscribed(user_id, False)
+            safe_db_call(db.set_subscribed, user_id, False)
             await message.answer(
                 f"🎁 Ты использовал все <b>{FREE_LIMIT}</b> бесплатных скачивания.\n\n"
                 f"Чтобы продолжить — подпишись на канал <b>{CHANNEL_NAME}</b>!\n\n"
@@ -226,8 +236,8 @@ async def handle_url(message: Message):
 
         video = FSInputFile(file_path)
         await message.answer_video(video=video, caption=AD_CAPTION)
-        db.increment_downloads(user_id)
-        db.log_download(user_id, url, "success")
+        safe_db_call(db.increment_downloads, user_id)
+        safe_db_call(db.log_download, user_id, url, "success")
 
         new_count = count + 1
         remaining = FREE_LIMIT - new_count
@@ -246,7 +256,7 @@ async def handle_url(message: Message):
     except Exception as e:
         err_text = str(e)
         logger.error(f"Ошибка [{user_id}] {url}: {err_text}")
-        db.log_download(user_id, url, f"error: {err_text[:100]}")
+        safe_db_call(db.log_download, user_id, url, f"error: {err_text[:100]}")
 
         if "filesize" in err_text.lower() or "too large" in err_text.lower():
             await message.answer("❌ Видео слишком большое (лимит 50 МБ)")
@@ -256,6 +266,9 @@ async def handle_url(message: Message):
             await message.answer("❌ Этот сайт не поддерживается")
         else:
             await message.answer("❌ Не удалось скачать. Попробуй другую ссылку")
+    except Exception as e:
+        logger.exception(f"Критическая ошибка в handle_url: {e}")
+        await message.answer("❌ Временная ошибка сервера. Попробуй ещё раз через 10-20 секунд.")
     finally:
         try:
             await wait_msg.delete()
