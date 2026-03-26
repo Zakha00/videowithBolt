@@ -86,5 +86,5 @@ async def main():
     print("Бот работает 🚀")
     await dp.start_polling(bot)
     
-if __name__ == "main":
+if __name__ == "__main__":
     asyncio.run(main())
