@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/your_channel")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@nookatbazar123")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/nookatbazar123")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Наш канал")
 
 AD_CAPTION = f"📥 Скачано через бот\n🔥 Подписывайся: {CHANNEL_URL}"
