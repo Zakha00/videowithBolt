@@ -9,11 +9,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import (
+    CallbackQuery, FSInputFile, Message,
+    InputMediaPhoto, InputMediaVideo,
+)
 
 import database as db
-from downloader import cleanup, download_video, is_valid_url, FREE_LIMIT
-from keyboards import check_again_keyboard, subscribe_keyboard
+from downloader import download, cleanup, is_valid_url, detect_type
+from keyboards import format_keyboard, subscribe_keyboard, check_again_keyboard
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -23,90 +26,126 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@nookatbazar123")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/nookatbazar123")
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "Наш канал")
-
-AD_CAPTION = f"📥 Скачано через бот\n🔥 Подписывайся: {CHANNEL_URL}"
+TOKEN       = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS   = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+CHANNEL_ID  = os.getenv("CHANNEL_ID", "@your_channel")   # для проверки подписки
 
 # ─── Антиспам ────────────────────────────────────────────────────────────────
-_last_request: dict[int, float] = defaultdict(float)
-RATE_LIMIT_SECONDS = 10
-
-
-def safe_db_call(fn, *args, **kwargs):
-    """Не даёт ошибкам БД ломать обработку апдейта."""
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:
-        logger.exception(f"Ошибка БД в {fn.__name__}: {e}")
-        return None
+_last_req: dict[int, float] = defaultdict(float)
+RATE_LIMIT = 8  # секунд
 
 
 def is_rate_limited(user_id: int) -> bool:
     now = time.time()
-    if now - _last_request[user_id] < RATE_LIMIT_SECONDS:
+    if now - _last_req[user_id] < RATE_LIMIT:
         return True
-    _last_request[user_id] = now
+    _last_req[user_id] = now
     return False
 
 
+# ─── Pending URLs (ждут выбора формата) ──────────────────────────────────────
+_pending: dict[int, str] = {}   # user_id → url
+
+
 # ─── Web-сервер для Render ────────────────────────────────────────────────────
-class Handler(BaseHTTPRequestHandler):
+class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        self.wfile.write(b"OK")
 
-    def log_message(self, *args):
+    def log_message(self, *a):
         pass
 
 
-def run_web():
+def _run_web():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
 
 
 # ─── Bot & Dispatcher ─────────────────────────────────────────────────────────
-bot: Bot | None = None
-dp = Dispatcher()
+bot = Bot(token=TOKEN)
+dp  = Dispatcher()
 
 
-# ─── Проверка подписки ────────────────────────────────────────────────────────
-async def check_subscription(user_id: int) -> bool:
-    if bot is None:
-        return True
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async def check_sub(user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status not in ("left", "kicked", "banned")
+        m = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return m.status not in ("left", "kicked", "banned")
     except Exception:
-        logger.warning("Не удалось проверить подписку, пропускаем")
-        return True
+        return True  # если бот не добавлен в канал — не блокируем
+
+
+def fmt_label(fmt: str) -> str:
+    return {"video": "📹 Видео", "audio": "🎵 MP3",
+            "720p": "📱 720p", "1080p": "🖥 1080p", "photo": "🖼 Фото"}.get(fmt, fmt)
+
+
+def _sub_text(user_id: int) -> str:
+    """Красивое сообщение с просьбой подписаться."""
+    ad_url, ad_name = db.get_next_ad_channel()
+    if not ad_url:
+        ad_url = "https://t.me/your_channel"
+        ad_name = "наш канал"
+
+    remaining = db.remaining_downloads(user_id)
+    used      = db.get_user(user_id)[2] if db.get_user(user_id) else 0
+
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔐 <b>Доступ ограничен</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Ты использовал <b>{used}</b> скачиваний.\n\n"
+        f"Чтобы получить ещё <b>{db.BATCH_SIZE} скачиваний</b> — "
+        f"подпишись на канал <b>{ad_name}</b> 👇\n\n"
+        "После подписки нажми ✅"
+    ), ad_url
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    safe_db_call(
-        db.upsert_user,
+    args = message.text.split(maxsplit=1)
+    referrer_id = None
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1][4:])
+        except ValueError:
+            pass
+
+    db.upsert_user(
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.first_name or "",
     )
-    count = safe_db_call(db.get_download_count, message.from_user.id) or 0
-    remaining = max(0, FREE_LIMIT - count)
+
+    if referrer_id and referrer_id != message.from_user.id:
+        if db.register_referral(referrer_id, message.from_user.id):
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 По твоей ссылке пришёл новый пользователь!\n"
+                    f"Тебе начислено +{db.REFERRAL_BONUS} скачивания 🎁"
+                )
+            except Exception:
+                pass
+
+    rem   = db.remaining_downloads(message.from_user.id)
+    total = db.downloads_allowed(message.from_user.id)
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
 
     text = (
         f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
-        "Я скачаю видео с:\n"
-        "• YouTube  • TikTok  • Instagram\n"
-        "• Twitter/X  • VK  • и 1000+ сайтов\n\n"
-        f"🎁 Бесплатных скачиваний: <b>{remaining}/{FREE_LIMIT}</b>\n\n"
-        "Просто отправь ссылку на видео ⬇️"
+        "Отправь мне ссылку и я скачаю видео с:\n"
+        "  YouTube  •  TikTok  •  Instagram\n"
+        "  Twitter/X  •  Facebook  •  Reddit\n"
+        "  и 1000+ других сайтов\n\n"
+        f"🎁 Доступно скачиваний: <b>{rem}/{total}</b>\n\n"
+        f"👥 Приглашай друзей и получай +{db.REFERRAL_BONUS} скачивания за каждого:\n"
+        f"<code>{ref_link}</code>"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -114,16 +153,67 @@ async def cmd_start(message: Message):
 # ─── /stats ───────────────────────────────────────────────────────────────────
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    count = safe_db_call(db.get_download_count, message.from_user.id) or 0
-    remaining = max(0, FREE_LIMIT - count)
-    is_sub = await check_subscription(message.from_user.id)
-    sub_status = "✅ Подписан" if is_sub else "❌ Не подписан"
+    uid   = message.from_user.id
+    user  = db.get_user(uid)
+    if not user:
+        await message.answer("Ты ещё не скачивал ничего. Отправь ссылку!")
+        return
+
+    dl    = user[2]   # downloads
+    rem   = db.remaining_downloads(uid)
+    total = db.downloads_allowed(uid)
+    refs  = db.get_referral_count(uid)
+    is_s  = await check_sub(uid)
+    sub_s = "✅ Подписан" if is_s else "❌ Не подписан"
+
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
 
     text = (
-        "📊 <b>Твоя статистика</b>\n\n"
-        f"📥 Всего скачиваний: <b>{count}</b>\n"
-        f"🎁 Бесплатных осталось: <b>{remaining}</b>\n"
-        f"📢 Подписка: {sub_status}"
+        "📊 <b>Твоя статистика</b>\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"📥 Всего скачиваний: <b>{dl}</b>\n"
+        f"🎁 Осталось сейчас: <b>{rem} из {total}</b>\n"
+        f"📢 Подписка: {sub_s}\n"
+        f"👥 Приглашено друзей: <b>{refs}</b>\n\n"
+        f"🔗 Твоя реферальная ссылка:\n<code>{ref_link}</code>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+# ─── /history ─────────────────────────────────────────────────────────────────
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    rows = db.get_history(message.from_user.id)
+    if not rows:
+        await message.answer("📭 История скачиваний пуста.")
+        return
+
+    lines = ["📋 <b>Последние скачивания:</b>\n"]
+    for i, (title, fmt, created_at) in enumerate(rows, 1):
+        date = created_at[:10] if created_at else ""
+        label = fmt_label(fmt)
+        lines.append(f"{i}. {label} — <i>{title[:50]}</i>\n   <code>{date}</code>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ─── /ref ─────────────────────────────────────────────────────────────────────
+@dp.message(Command("ref"))
+async def cmd_ref(message: Message):
+    uid = message.from_user.id
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
+    refs = db.get_referral_count(uid)
+
+    text = (
+        "👥 <b>Реферальная программа</b>\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"За каждого приглашённого друга ты получаешь\n"
+        f"<b>+{db.REFERRAL_BONUS} скачивания</b> бесплатно!\n\n"
+        f"👥 Ты пригласил: <b>{refs}</b> чел.\n\n"
+        f"🔗 Твоя ссылка:\n<code>{ref_link}</code>\n\n"
+        "Поделись с друзьями! 🚀"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -134,174 +224,262 @@ async def cmd_admin(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    total_users = safe_db_call(db.get_total_users) or 0
-    today = safe_db_call(db.get_today_stats)
-    today_dl = today[1] if today else 0
+    total_users = db.get_total_users()
+    today       = db.get_today_stats()
+    today_dl    = today[1] if today else 0
+    all_dl      = db.get_total_downloads_all()
+    channels    = db.get_ad_channels()
+    ch_list = "\n".join(f"  [{c[0]}] {c[2]} — {c[1]}" for c in channels) or "  (нет каналов)"
 
     text = (
-        "🛠 <b>Админ-панель</b>\n\n"
+        "🛠 <b>Админ-панель</b>\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
-        f"📥 Скачиваний сегодня: <b>{today_dl}</b>"
+        f"📥 Скачиваний сегодня: <b>{today_dl}</b>\n"
+        f"📊 Всего скачиваний: <b>{all_dl}</b>\n\n"
+        f"📢 <b>Рекламные каналы:</b>\n{ch_list}\n\n"
+        "<b>Команды управления:</b>\n"
+        "/addad URL Название — добавить канал\n"
+        "/delad ID — удалить канал\n"
+        "/broadcast Текст — рассылка"
     )
     await message.answer(text, parse_mode="HTML")
 
 
-# ─── /broadcast ───────────────────────────────────────────────────────────────
+@dp.message(Command("addad"))
+async def cmd_addad(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = message.text.removeprefix("/addad").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /addad https://t.me/channel Название канала")
+        return
+    url, name = parts[0], parts[1]
+    db.add_ad_channel(url, name)
+    await message.answer(f"✅ Канал добавлен: <b>{name}</b>", parse_mode="HTML")
+
+
+@dp.message(Command("delad"))
+async def cmd_delad(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        cid = int(message.text.removeprefix("/delad").strip())
+        db.remove_ad_channel(cid)
+        await message.answer(f"✅ Канал #{cid} удалён")
+    except ValueError:
+        await message.answer("Использование: /delad 1")
+
+
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-
     text = message.text.removeprefix("/broadcast").strip()
     if not text:
-        await message.answer("Использование: /broadcast Текст")
+        await message.answer("Использование: /broadcast Текст сообщения")
         return
 
-    user_ids = safe_db_call(db.get_all_user_ids) or []
+    user_ids = db.get_all_user_ids()
     sent, failed = 0, 0
     status_msg = await message.answer(f"⏳ Рассылаю {len(user_ids)} пользователям...")
 
     for uid in user_ids:
         try:
-            if bot is None:
-                break
             await bot.send_message(uid, text, parse_mode="HTML")
             sent += 1
         except (TelegramForbiddenError, TelegramBadRequest):
             failed += 1
-        await asyncio.sleep(0.05)  # ~20 сообщений/сек
+        await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✅ Рассылка завершена\n"
-        f"📤 Отправлено: {sent}\n"
-        f"❌ Ошибок: {failed}"
+        f"✅ Готово!\n📤 Отправлено: <b>{sent}</b>\n❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML"
     )
 
 
 # ─── Callback: проверка подписки ──────────────────────────────────────────────
 @dp.callback_query(F.data == "check_sub")
-async def callback_check_sub(call: CallbackQuery):
-    is_sub = await check_subscription(call.from_user.id)
-    if is_sub:
-        safe_db_call(db.set_subscribed, call.from_user.id, True)
+async def cb_check_sub(call: CallbackQuery):
+    uid = call.from_user.id
+    if await check_sub(uid):
+        db.grant_subscription(uid)
+        rem = db.remaining_downloads(uid)
         await call.message.edit_text(
             "✅ <b>Подписка подтверждена!</b>\n\n"
-            "Теперь можешь скачивать без ограничений.\n"
+            f"🎁 Тебе открыто <b>{db.BATCH_SIZE}</b> новых скачиваний.\n"
+            f"Доступно сейчас: <b>{rem}</b>\n\n"
             "Отправь ссылку на видео ⬇️",
             parse_mode="HTML"
         )
     else:
-        await call.answer("❌ Ты ещё не подписался!", show_alert=True)
-        await call.message.edit_reply_markup(reply_markup=check_again_keyboard())
+        await call.answer("❌ Подписка не найдена. Подпишись и попробуй снова!", show_alert=True)
+        try:
+            await call.message.edit_reply_markup(reply_markup=check_again_keyboard())
+        except Exception:
+            pass
 
 
-# ─── Основной обработчик ──────────────────────────────────────────────────────
+# ─── Callback: выбор формата ──────────────────────────────────────────────────
+@dp.callback_query(F.data.startswith("fmt:"))
+async def cb_format(call: CallbackQuery):
+    uid = call.from_user.id
+    fmt = call.data.split(":")[1]
+    url = _pending.pop(uid, None)
+
+    if not url:
+        await call.answer("⏰ Ссылка устарела. Отправь её снова.", show_alert=True)
+        return
+
+    await call.message.edit_text(
+        f"⏳ Скачиваю {fmt_label(fmt)}...\n<i>Обычно 5–20 секунд</i>",
+        parse_mode="HTML"
+    )
+
+    result = None
+    try:
+        result = await download(url, fmt)
+
+        ad_url, ad_name = db.get_next_ad_channel()
+        caption = "🎉 <b>Готово!</b>"
+        if ad_url:
+            caption += f"\n\n📢 Подпишись: <a href='{ad_url}'>{ad_name}</a>"
+
+        if fmt == "audio":
+            audio = FSInputFile(result.path)
+            await call.message.answer_audio(
+                audio=audio,
+                title=result.title[:64] if result.title else "Audio",
+                caption=caption,
+                parse_mode="HTML"
+            )
+        else:
+            video = FSInputFile(result.path)
+            await call.message.answer_video(
+                video=video,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        db.increment_downloads(uid)
+        db.log_download(uid, url, result.title, fmt, "ok")
+
+        rem = db.remaining_downloads(uid)
+        if rem == 0:
+            # Сразу предупреждаем о следующей подписке
+            ad_url2, ad_name2 = db.get_next_ad_channel()
+            if not ad_url2:
+                ad_url2 = "https://t.me/your_channel"
+                ad_name2 = "наш канал"
+            await call.message.answer(
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "🔐 <b>Скачивания закончились!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Подпишись на <b>{ad_name2}</b>, чтобы получить ещё "
+                f"<b>{db.BATCH_SIZE}</b> скачиваний 👇",
+                parse_mode="HTML",
+                reply_markup=subscribe_keyboard(ad_url2)
+            )
+        elif 0 < rem <= 2:
+            await call.message.answer(
+                f"⚠️ Осталось скачиваний: <b>{rem}</b>\n"
+                "Скоро потребуется подписка на канал.",
+                parse_mode="HTML"
+            )
+
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
+    except ValueError as e:
+        db.log_download(uid, url, "", fmt, "error_size")
+        await call.message.edit_text(
+            f"❌ <b>{e}</b>\n\nПопробуй выбрать формат <b>720p</b> — он меньше весит.",
+            parse_mode="HTML",
+            reply_markup=format_keyboard()
+        )
+        _pending[uid] = url
+
+    except Exception as e:
+        err = str(e).lower()
+        db.log_download(uid, url, "", fmt, f"error: {str(e)[:80]}")
+        logger.error(f"Download error [{uid}] [{fmt}] {url}: {e}")
+
+        if "private" in err or "unavailable" in err or "not available" in err:
+            msg = "❌ Видео недоступно или приватное."
+        elif "unsupported" in err:
+            msg = "❌ Этот сайт не поддерживается."
+        elif "login" in err or "sign in" in err:
+            msg = "❌ Видео требует авторизации (приватное)."
+        else:
+            msg = "❌ Не удалось скачать. Попробуй другую ссылку."
+
+        await call.message.edit_text(msg, parse_mode="HTML")
+
+    finally:
+        if result:
+            cleanup(result.path)
+
+
+# ─── Основной обработчик ссылок ───────────────────────────────────────────────
 @dp.message(F.text)
 async def handle_url(message: Message):
     url = message.text.strip()
+    uid = message.from_user.id
 
     if not is_valid_url(url):
-        await message.answer("❌ Отправь ссылку на видео (начинается с http)")
+        await message.answer(
+            "❓ Отправь мне ссылку на видео.\n\n"
+            "Поддерживаемые сайты:\n"
+            "YouTube • TikTok • Instagram • Twitter/X • Facebook • Reddit и др."
+        )
         return
 
-    user_id = message.from_user.id
-    safe_db_call(db.upsert_user, user_id, message.from_user.username or "", message.from_user.first_name or "")
+    db.upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
 
-    if is_rate_limited(user_id):
-        await message.answer(f"⏱ Подожди {RATE_LIMIT_SECONDS} сек между запросами")
+    # Антиспам
+    if is_rate_limited(uid):
+        await message.answer(f"⏱ Подожди немного между запросами.")
         return
 
-    count = safe_db_call(db.get_download_count, user_id) or 0
-    if count >= FREE_LIMIT:
-        is_sub = await check_subscription(user_id)
-        if not is_sub:
-            safe_db_call(db.set_subscribed, user_id, False)
-            await message.answer(
-                f"🎁 Ты использовал все <b>{FREE_LIMIT}</b> бесплатных скачивания.\n\n"
-                f"Чтобы продолжить — подпишись на канал <b>{CHANNEL_NAME}</b>!\n\n"
-                "После подписки нажми кнопку ниже ✅",
-                parse_mode="HTML",
-                reply_markup=subscribe_keyboard(CHANNEL_URL, CHANNEL_ID),
-            )
+    # Проверка лимита
+    if db.needs_subscription(uid):
+        is_s = await check_sub(uid)
+        if not is_s:
+            text, ad_url = _sub_text(uid)
+            await message.answer(text, parse_mode="HTML", reply_markup=subscribe_keyboard(ad_url))
             return
-
-    wait_msg = await message.answer("⏳ Скачиваю видео, подожди...")
-
-    file_path = None
-    try:
-        file_path = await download_video(url)
-
-        if not file_path or not os.path.exists(file_path):
-            raise FileNotFoundError("Файл не создан")
-
-        video = FSInputFile(file_path)
-        await message.answer_video(video=video, caption=AD_CAPTION)
-        safe_db_call(db.increment_downloads, user_id)
-        safe_db_call(db.log_download, user_id, url, "success")
-
-        new_count = count + 1
-        remaining = FREE_LIMIT - new_count
-        if 0 < remaining <= 2:
-            await message.answer(
-                f"⚠️ Осталось бесплатных скачиваний: <b>{remaining}</b>\n"
-                f"Подпишись на {CHANNEL_URL} чтобы не потерять доступ!",
-                parse_mode="HTML",
-            )
-        elif remaining == 0:
-            await message.answer(
-                f"⚠️ Это было последнее бесплатное скачивание!\n"
-                f"Подпишись на канал чтобы продолжить: {CHANNEL_URL}"
-            )
-
-    except Exception as e:
-        err_text = str(e)
-        logger.error(f"Ошибка [{user_id}] {url}: {err_text}")
-        safe_db_call(db.log_download, user_id, url, f"error: {err_text[:100]}")
-
-        if "filesize" in err_text.lower() or "too large" in err_text.lower():
-            await message.answer("❌ Видео слишком большое (лимит 50 МБ)")
-        elif "private" in err_text.lower() or "unavailable" in err_text.lower():
-            await message.answer("❌ Видео недоступно или приватное")
-        elif "unsupported" in err_text.lower():
-            await message.answer("❌ Этот сайт не поддерживается")
         else:
-            await message.answer("❌ Не удалось скачать. Попробуй другую ссылку")
-    except Exception as e:
-        logger.exception(f"Критическая ошибка в handle_url: {e}")
-        await message.answer("❌ Временная ошибка сервера. Попробуй ещё раз через 10-20 секунд.")
-    finally:
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
-        if file_path:
-            cleanup(file_path)
+            # Уже подписан — авто-даём батч
+            db.grant_subscription(uid)
+            await message.answer(
+                f"✅ Отлично! Тебе начислено <b>{db.BATCH_SIZE}</b> новых скачиваний.",
+                parse_mode="HTML"
+            )
+
+    # Сохраняем URL и показываем выбор формата
+    _pending[uid] = url
+
+    await message.answer(
+        "🔗 <b>Ссылка получена!</b>\n\n"
+        "Выбери формат:",
+        parse_mode="HTML",
+        reply_markup=format_keyboard()
+    )
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    global bot
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
-    bot = Bot(token=TOKEN)
-    # На Render иногда остаётся старый webhook (или следы прошлых запусков),
-    # из-за чего polling получает 0 апдейтов.
-    await bot.delete_webhook(drop_pending_updates=False)
-    logger.info("✅ Webhook отключен, работаем в polling режиме")
+    db.init_db()
+    logger.info("✅ БД инициализирована (Turso)")
 
-    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=_run_web, daemon=True).start()
     logger.info("✅ Web-сервер запущен")
-
-    await db.init_db()
-    logger.info("✅ База данных (Turso) инициализирована")
 
     logger.info("🚀 Бот запущен!")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception:
-        logger.exception("❌ Фатальная ошибка при запуске")
-        raise
+    asyncio.run(main())
