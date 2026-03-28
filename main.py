@@ -563,7 +563,6 @@ async def cb_format(call: CallbackQuery):
             pass
 
     except ValueError as e:
-        # Файл слишком большой
         db.log_download(uid, url, "", fmt, "error_size")
         _pending[uid] = (url, reply_id)
         await call.message.edit_text(
@@ -572,23 +571,33 @@ async def cb_format(call: CallbackQuery):
             reply_markup=try_smaller_keyboard(),
         )
 
+    except FileNotFoundError as e:
+        db.log_download(uid, url, "", fmt, "error_not_found")
+        logger.error(f"File not found [{uid}] [{fmt}] {url}: {e}")
+        await call.message.edit_text(
+            "❌ Файл не найден после скачивания.\n"
+            "Попробуй другой формат или другую ссылку."
+        )
+
     except Exception as e:
         err = str(e).lower()
         db.log_download(uid, url, "", fmt, f"err:{str(e)[:80]}")
-        logger.error(f"Download [{uid}] [{fmt}] {url}: {e}")
+        logger.exception(f"Download error [{uid}] [{fmt}] {url}")
 
         if "private" in err or "unavailable" in err or "not available" in err:
             msg = "❌ Видео недоступно или приватное."
-        elif "unsupported" in err:
-            msg = "❌ Этот сайт не поддерживается."
+        elif "unsupported" in err or "no video formats" in err or "no formats found" in err:
+            msg = "❌ Не удалось скачать в этом формате.\nПопробуй другой формат."
         elif "login" in err or "sign in" in err:
             msg = "❌ Видео требует входа (приватный аккаунт)."
-        elif "not found" in err:
+        elif "not found" in err or "http error 404" in err:
             msg = "❌ Видео не найдено — возможно удалено."
+        elif "timeout" in err or "timed out" in err:
+            msg = "❌ Превышено время ожидания. Попробуй ещё раз."
         else:
-            msg = "❌ Не удалось скачать. Попробуй другую ссылку."
+            msg = f"❌ Не удалось скачать.\n\nОшибка: {str(e)[:100]}"
 
-        await call.message.edit_text(msg)
+        await call.message.edit_text(msg, parse_mode="HTML")
 
     finally:
         cleanup(*all_paths)
@@ -639,9 +648,16 @@ async def group_cmd_download(message: Message):
         await wait.delete()
     except ValueError as e:
         await wait.edit_text(f"❌ {e}")
+    except FileNotFoundError as e:
+        logger.error(f"File not found in group [{uid}] {url}: {e}")
+        await wait.edit_text("❌ Файл не найден. Попробуй другой формат.")
     except Exception as e:
-        logger.error(f"Group dl [{uid}] {url}: {e}")
-        await wait.edit_text("❌ Не удалось скачать. Попробуй в личном чате.")
+        err = str(e).lower()
+        logger.exception(f"Group dl [{uid}] {url}")
+        if "no video formats" in err or "no formats found" in err:
+            await wait.edit_text("❌ Не удалось скачать в этом формате.")
+        else:
+            await wait.edit_text(f"❌ Не удалось скачать.\n{str(e)[:80]}")
     finally:
         cleanup(*all_paths)
 
